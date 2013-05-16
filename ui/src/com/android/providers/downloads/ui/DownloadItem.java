@@ -18,8 +18,11 @@ package com.android.providers.downloads.ui;
 
 import android.content.Context;
 import android.util.AttributeSet;
+import android.view.accessibility.AccessibilityEvent;
 import android.view.MotionEvent;
 import android.widget.CheckBox;
+import android.widget.Checkable;
+import android.widget.GridLayout;
 import android.widget.RelativeLayout;
 
 /**
@@ -28,18 +31,16 @@ import android.widget.RelativeLayout;
  * also keeps an ID associated with the currently displayed download and notifies a listener upon
  * selection changes with that ID.
  */
-public class DownloadItem extends RelativeLayout {
+public class DownloadItem extends GridLayout implements Checkable {
     private static float CHECKMARK_AREA = -1;
 
     private boolean mIsInDownEvent = false;
     private CheckBox mCheckBox;
     private long mDownloadId;
-    private DownloadSelectListener mListener;
-
-    static interface DownloadSelectListener {
-        public void onDownloadSelectionChanged(long downloadId, boolean isSelected);
-        public boolean isDownloadSelected(long id);
-    }
+    private String mFileName;
+    private String mMimeType;
+    private DownloadList mDownloadList;
+    private int mPosition;
 
     public DownloadItem(Context context, AttributeSet attrs, int defStyle) {
         super(context, attrs, defStyle);
@@ -68,12 +69,18 @@ public class DownloadItem extends RelativeLayout {
         mCheckBox = (CheckBox) findViewById(R.id.download_checkbox);
     }
 
-    public void setDownloadId(long downloadId) {
+    public void setData(long downloadId, int position, String fileName, String mimeType) {
         mDownloadId = downloadId;
+        mPosition = position;
+        mFileName = fileName;
+        mMimeType = mimeType;
+        if (mDownloadList.isDownloadSelected(downloadId)) {
+            setChecked(true);
+        }
     }
 
-    public void setSelectListener(DownloadSelectListener listener) {
-        mListener = listener;
+    public void setDownloadListObj(DownloadList downloadList) {
+        mDownloadList = downloadList;
     }
 
     @Override
@@ -93,7 +100,8 @@ public class DownloadItem extends RelativeLayout {
 
             case MotionEvent.ACTION_UP:
                 if (mIsInDownEvent && event.getX() < CHECKMARK_AREA) {
-                    toggleCheckMark();
+                    toggle();
+                    sendAccessibilityEvent(AccessibilityEvent.TYPE_VIEW_CLICKED);
                     handled = true;
                 }
                 mIsInDownEvent = false;
@@ -109,8 +117,33 @@ public class DownloadItem extends RelativeLayout {
         return handled;
     }
 
-    private void toggleCheckMark() {
-        mCheckBox.toggle();
-        mListener.onDownloadSelectionChanged(mDownloadId, mCheckBox.isChecked());
+    @Override
+    public boolean isChecked() {
+        return mCheckBox.isChecked();
+    }
+
+    @Override
+    public void setChecked(boolean checked) {
+        mCheckBox.setChecked(checked);
+        mDownloadList.onDownloadSelectionChanged(mDownloadId, mCheckBox.isChecked(),
+                mFileName, mMimeType);
+        mDownloadList.getCurrentView().setItemChecked(mPosition, mCheckBox.isChecked());
+    }
+
+    @Override
+    public void toggle() {
+        setChecked(!isChecked());
+    }
+
+    public CheckBox getCheckBox() {
+        return this.mCheckBox;
+    }
+
+    public String getFileName() {
+        return mFileName;
+    }
+
+    public String getMimeType() {
+        return mMimeType;
     }
 }

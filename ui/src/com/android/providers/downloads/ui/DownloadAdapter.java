@@ -23,19 +23,15 @@ import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
 import android.content.res.Resources;
 import android.database.Cursor;
-import android.drm.mobile1.DrmRawContent;
 import android.graphics.drawable.Drawable;
 import android.net.Uri;
 import android.text.format.Formatter;
 import android.view.LayoutInflater;
 import android.view.View;
 import android.view.ViewGroup;
-import android.widget.CheckBox;
 import android.widget.CursorAdapter;
 import android.widget.ImageView;
 import android.widget.TextView;
-
-import com.android.providers.downloads.ui.DownloadItem.DownloadSelectListener;
 
 import java.text.DateFormat;
 import java.util.Calendar;
@@ -47,29 +43,27 @@ import java.util.List;
  * List adapter for Cursors returned by {@link DownloadManager}.
  */
 public class DownloadAdapter extends CursorAdapter {
-    private Context mContext;
+    private final DownloadList mDownloadList;
     private Cursor mCursor;
-    private DownloadSelectListener mDownloadSelectionListener;
     private Resources mResources;
     private DateFormat mDateFormat;
     private DateFormat mTimeFormat;
 
-    private int mTitleColumnId;
-    private int mDescriptionColumnId;
-    private int mStatusColumnId;
-    private int mReasonColumnId;
-    private int mTotalBytesColumnId;
-    private int mMediaTypeColumnId;
-    private int mDateColumnId;
-    private int mIdColumnId;
+    private final int mTitleColumnId;
+    private final int mDescriptionColumnId;
+    private final int mStatusColumnId;
+    private final int mReasonColumnId;
+    private final int mTotalBytesColumnId;
+    private final int mMediaTypeColumnId;
+    private final int mDateColumnId;
+    private final int mIdColumnId;
+    private final int mFileNameColumnId;
 
-    public DownloadAdapter(Context context, Cursor cursor,
-            DownloadSelectListener selectionListener) {
-        super(context, cursor);
-        mContext = context;
+    public DownloadAdapter(DownloadList downloadList, Cursor cursor) {
+        super(downloadList, cursor);
+        mDownloadList = downloadList;
         mCursor = cursor;
-        mResources = mContext.getResources();
-        mDownloadSelectionListener = selectionListener;
+        mResources = mDownloadList.getResources();
         mDateFormat = DateFormat.getDateInstance(DateFormat.SHORT);
         mTimeFormat = DateFormat.getTimeInstance(DateFormat.SHORT);
 
@@ -82,22 +76,26 @@ public class DownloadAdapter extends CursorAdapter {
         mMediaTypeColumnId = cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_MEDIA_TYPE);
         mDateColumnId =
                 cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LAST_MODIFIED_TIMESTAMP);
+        mFileNameColumnId =
+                cursor.getColumnIndexOrThrow(DownloadManager.COLUMN_LOCAL_FILENAME);
     }
 
     public View newView() {
-        DownloadItem view = (DownloadItem) LayoutInflater.from(mContext)
+        final DownloadItem view = (DownloadItem) LayoutInflater.from(mDownloadList)
                 .inflate(R.layout.download_list_item, null);
-        view.setSelectListener(mDownloadSelectionListener);
+        view.setDownloadListObj(mDownloadList);
         return view;
     }
 
-    public void bindView(View convertView) {
+    public void bindView(View convertView, int position) {
         if (!(convertView instanceof DownloadItem)) {
             return;
         }
 
         long downloadId = mCursor.getLong(mIdColumnId);
-        ((DownloadItem) convertView).setDownloadId(downloadId);
+        ((DownloadItem) convertView).setData(downloadId, position,
+                mCursor.getString(mFileNameColumnId),
+                mCursor.getString(mMediaTypeColumnId));
 
         // Retrieve the icon for this download
         retrieveAndSetIcon(convertView);
@@ -109,11 +107,18 @@ public class DownloadAdapter extends CursorAdapter {
         setTextForView(convertView, R.id.download_title, title);
         setTextForView(convertView, R.id.domain, mCursor.getString(mDescriptionColumnId));
         setTextForView(convertView, R.id.size_text, getSizeText());
-        setTextForView(convertView, R.id.status_text, mResources.getString(getStatusStringId()));
-        setTextForView(convertView, R.id.last_modified_date, getDateString());
 
-        CheckBox checkBox = (CheckBox) convertView.findViewById(R.id.download_checkbox);
-        checkBox.setChecked(mDownloadSelectionListener.isDownloadSelected(downloadId));
+        final int status = mCursor.getInt(mStatusColumnId);
+        final CharSequence statusText;
+        if (status == DownloadManager.STATUS_SUCCESSFUL) {
+            statusText = getDateString();
+        } else {
+            statusText = mResources.getString(getStatusStringId(status));
+        }
+        setTextForView(convertView, R.id.status_text, statusText);
+
+        ((DownloadItem) convertView).getCheckBox()
+                .setChecked(mDownloadList.isDownloadSelected(downloadId));
     }
 
     private String getDateString() {
@@ -143,8 +148,8 @@ public class DownloadAdapter extends CursorAdapter {
         return sizeText;
     }
 
-    private int getStatusStringId() {
-        switch (mCursor.getInt(mStatusColumnId)) {
+    private int getStatusStringId(int status) {
+        switch (status) {
             case DownloadManager.STATUS_FAILED:
                 return R.string.download_error;
 
@@ -156,10 +161,12 @@ public class DownloadAdapter extends CursorAdapter {
                 return R.string.download_running;
 
             case DownloadManager.STATUS_PAUSED:
-                if (mCursor.getInt(mReasonColumnId) == DownloadManager.PAUSED_QUEUED_FOR_WIFI) {
-                    return R.string.download_queued;
-                } else {
-                    return R.string.download_running;
+                final int reason = mCursor.getInt(mReasonColumnId);
+                switch (reason) {
+                    case DownloadManager.PAUSED_QUEUED_FOR_WIFI:
+                        return R.string.download_queued;
+                    default:
+                        return R.string.download_running;
                 }
         }
         throw new IllegalStateException("Unknown status: " + mCursor.getInt(mStatusColumnId));
@@ -174,26 +181,22 @@ public class DownloadAdapter extends CursorAdapter {
             return;
         }
 
-        if (DrmRawContent.DRM_MIMETYPE_MESSAGE_STRING.equalsIgnoreCase(mediaType)) {
-            iconView.setImageResource(R.drawable.ic_launcher_drm_file);
+        Intent intent = new Intent(Intent.ACTION_VIEW);
+        intent.setDataAndType(Uri.fromParts("file", "", null), mediaType);
+        PackageManager pm = mContext.getPackageManager();
+        List<ResolveInfo> list = pm.queryIntentActivities(intent,
+                PackageManager.MATCH_DEFAULT_ONLY);
+        if (list.size() == 0) {
+            // no icon found for this mediatype. use "unknown" icon
+            iconView.setImageResource(R.drawable.ic_download_misc_file_type);
         } else {
-            Intent intent = new Intent(Intent.ACTION_VIEW);
-            intent.setDataAndType(Uri.fromParts("file", "", null), mediaType);
-            PackageManager pm = mContext.getPackageManager();
-            List<ResolveInfo> list = pm.queryIntentActivities(intent,
-                    PackageManager.MATCH_DEFAULT_ONLY);
-            if (list.size() == 0) {
-                // no icon found for this mediatype. use "unknown" icon
-                iconView.setImageResource(R.drawable.ic_download_misc_file_type);
-            } else {
-                Drawable icon = list.get(0).activityInfo.loadIcon(pm);
-                iconView.setImageDrawable(icon);
-            }
+            Drawable icon = list.get(0).activityInfo.loadIcon(pm);
+            iconView.setImageDrawable(icon);
         }
         iconView.setVisibility(View.VISIBLE);
     }
 
-    private void setTextForView(View parent, int textViewId, String text) {
+    private void setTextForView(View parent, int textViewId, CharSequence text) {
         TextView view = (TextView) parent.findViewById(textViewId);
         view.setText(text);
     }
@@ -207,6 +210,6 @@ public class DownloadAdapter extends CursorAdapter {
 
     @Override
     public void bindView(View view, Context context, Cursor cursor) {
-        bindView(view);
+        bindView(view, cursor.getPosition());
     }
 }

@@ -16,20 +16,15 @@
 
 package com.android.providers.downloads;
 
-import android.content.ContentResolver;
-import android.content.ContentUris;
 import android.content.Context;
 import android.content.Intent;
 import android.content.pm.PackageManager;
 import android.content.pm.ResolveInfo;
-import android.database.Cursor;
-import android.drm.mobile1.DrmRawContent;
+import android.net.NetworkInfo;
 import android.net.Uri;
 import android.os.Environment;
-import android.os.StatFs;
 import android.os.SystemClock;
 import android.provider.Downloads;
-import android.util.Config;
 import android.util.Log;
 import android.webkit.MimeTypeMap;
 
@@ -43,7 +38,6 @@ import java.util.regex.Pattern;
  * Some helper functions for the download manager
  */
 public class Helpers {
-
     public static Random sRandom = new Random(SystemClock.uptimeMillis());
 
     /** Regex used to parse content-disposition headers */
@@ -72,22 +66,9 @@ public class Helpers {
     }
 
     /**
-     * Exception thrown from methods called by generateSaveFile() for any fatal error.
-     */
-    public static class GenerateSaveFileError extends Exception {
-        int mStatus;
-        String mMessage;
-
-        public GenerateSaveFileError(int status, String message) {
-            mStatus = status;
-            mMessage = message;
-        }
-    }
-
-    /**
      * Creates a filename (where the file should be saved) from info about a download.
      */
-    public static String generateSaveFile(
+    static String generateSaveFile(
             Context context,
             String url,
             String hint,
@@ -96,83 +77,64 @@ public class Helpers {
             String mimeType,
             int destination,
             long contentLength,
-            boolean isPublicApi) throws GenerateSaveFileError {
+            boolean isPublicApi, StorageManager storageManager) throws StopRequestException {
         checkCanHandleDownload(context, mimeType, destination, isPublicApi);
+        String path;
+        File base = null;
         if (destination == Downloads.Impl.DESTINATION_FILE_URI) {
-            return getPathForFileUri(hint, contentLength);
+            path = Uri.parse(hint).getPath();
         } else {
-            return chooseFullPath(context, url, hint, contentDisposition, contentLocation, mimeType,
-                    destination, contentLength);
+            base = storageManager.locateDestinationDirectory(mimeType, destination,
+                    contentLength);
+            path = chooseFilename(url, hint, contentDisposition, contentLocation,
+                                             destination);
         }
-    }
-
-    private static String getPathForFileUri(String hint, long contentLength)
-            throws GenerateSaveFileError {
-        if (!isExternalMediaMounted()) {
-            throw new GenerateSaveFileError(Downloads.Impl.STATUS_DEVICE_NOT_FOUND_ERROR,
-                    "external media not mounted");
+        storageManager.verifySpace(destination, path, contentLength);
+        path = getFullPath(path, mimeType, destination, base);
+        if (DownloadDrmHelper.isDrmConvertNeeded(mimeType)) {
+            path = DownloadDrmHelper.modifyDrmFwLockFileExtension(path);
         }
-        String path = Uri.parse(hint).getPath();
-        if (new File(path).exists()) {
-            Log.d(Constants.TAG, "File already exists: " + path);
-            throw new GenerateSaveFileError(Downloads.Impl.STATUS_FILE_ALREADY_EXISTS_ERROR,
-                    "requested destination file already exists");
-        }
-        if (getAvailableBytes(getFilesystemRoot(path)) < contentLength) {
-            throw new GenerateSaveFileError(Downloads.Impl.STATUS_INSUFFICIENT_SPACE_ERROR,
-                    "insufficient space on external storage");
-        }
-
         return path;
     }
 
-    /**
-     * @return the root of the filesystem containing the given path
-     */
-    public static File getFilesystemRoot(String path) {
-        File cache = Environment.getDownloadCacheDirectory();
-        if (path.startsWith(cache.getPath())) {
-            return cache;
-        }
-        File external = Environment.getExternalStorageDirectory();
-        if (path.startsWith(external.getPath())) {
-            return external;
-        }
-        throw new IllegalArgumentException("Cannot determine filesystem root for " + path);
-    }
-
-    private static String chooseFullPath(Context context, String url, String hint,
-                                         String contentDisposition, String contentLocation,
-                                         String mimeType, int destination, long contentLength)
-            throws GenerateSaveFileError {
-        File base = locateDestinationDirectory(context, mimeType, destination, contentLength);
-        String filename = chooseFilename(url, hint, contentDisposition, contentLocation,
-                                         destination);
-
-        // Split filename between base and extension
-        // Add an extension if filename does not have one
+    static String getFullPath(String filename, String mimeType, int destination, File base)
+            throws StopRequestException {
         String extension = null;
-        int dotIndex = filename.indexOf('.');
-        if (dotIndex < 0) {
-            extension = chooseExtensionFromMimeType(mimeType, true);
+        int dotIndex = filename.lastIndexOf('.');
+        boolean missingExtension = dotIndex < 0 || dotIndex < filename.lastIndexOf('/');
+        if (destination == Downloads.Impl.DESTINATION_FILE_URI) {
+            // Destination is explicitly set - do not change the extension
+            if (missingExtension) {
+                extension = "";
+            } else {
+                extension = filename.substring(dotIndex);
+                filename = filename.substring(0, dotIndex);
+            }
         } else {
-            extension = chooseExtensionFromFilename(mimeType, destination, filename, dotIndex);
-            filename = filename.substring(0, dotIndex);
+            // Split filename between base and extension
+            // Add an extension if filename does not have one
+            if (missingExtension) {
+                extension = chooseExtensionFromMimeType(mimeType, true);
+            } else {
+                extension = chooseExtensionFromFilename(mimeType, destination, filename, dotIndex);
+                filename = filename.substring(0, dotIndex);
+            }
         }
 
         boolean recoveryDir = Constants.RECOVERY_DIRECTORY.equalsIgnoreCase(filename + extension);
 
-        filename = base.getPath() + File.separator + filename;
+        if (base != null) {
+            filename = base.getPath() + File.separator + filename;
+        }
 
         if (Constants.LOGVV) {
             Log.v(Constants.TAG, "target file: " + filename + extension);
         }
-
         return chooseUniqueFilename(destination, filename, extension, recoveryDir);
     }
 
     private static void checkCanHandleDownload(Context context, String mimeType, int destination,
-            boolean isPublicApi) throws GenerateSaveFileError {
+            boolean isPublicApi) throws StopRequestException {
         if (isPublicApi) {
             return;
         }
@@ -180,10 +142,10 @@ public class Helpers {
         if (destination == Downloads.Impl.DESTINATION_EXTERNAL
                 || destination == Downloads.Impl.DESTINATION_CACHE_PARTITION_PURGEABLE) {
             if (mimeType == null) {
-                throw new GenerateSaveFileError(Downloads.Impl.STATUS_NOT_ACCEPTABLE,
+                throw new StopRequestException(Downloads.Impl.STATUS_NOT_ACCEPTABLE,
                         "external download with no mime type not allowed");
             }
-            if (!DrmRawContent.DRM_MIMETYPE_MESSAGE_STRING.equalsIgnoreCase(mimeType)) {
+            if (!DownloadDrmHelper.isDrmMimeType(context, mimeType)) {
                 // Check to see if we are allowed to download this file. Only files
                 // that can be handled by the platform can be downloaded.
                 // special case DRM files, which we should always allow downloading.
@@ -205,87 +167,11 @@ public class Helpers {
                     if (Constants.LOGV) {
                         Log.v(Constants.TAG, "no handler found for type " + mimeType);
                     }
-                    throw new GenerateSaveFileError(Downloads.Impl.STATUS_NOT_ACCEPTABLE,
+                    throw new StopRequestException(Downloads.Impl.STATUS_NOT_ACCEPTABLE,
                             "no handler found for this download type");
                 }
             }
         }
-    }
-
-    private static File locateDestinationDirectory(Context context, String mimeType,
-                                                   int destination, long contentLength)
-            throws GenerateSaveFileError {
-        // DRM messages should be temporarily stored internally and then passed to
-        // the DRM content provider
-        if (destination == Downloads.Impl.DESTINATION_CACHE_PARTITION
-                || destination == Downloads.Impl.DESTINATION_CACHE_PARTITION_PURGEABLE
-                || destination == Downloads.Impl.DESTINATION_CACHE_PARTITION_NOROAMING
-                || DrmRawContent.DRM_MIMETYPE_MESSAGE_STRING.equalsIgnoreCase(mimeType)) {
-            return getCacheDestination(context, contentLength);
-        }
-
-        return getExternalDestination(contentLength);
-    }
-
-    private static File getExternalDestination(long contentLength) throws GenerateSaveFileError {
-        if (!isExternalMediaMounted()) {
-            throw new GenerateSaveFileError(Downloads.Impl.STATUS_DEVICE_NOT_FOUND_ERROR,
-                    "external media not mounted");
-        }
-
-        File root = Environment.getExternalStorageDirectory();
-        if (getAvailableBytes(root) < contentLength) {
-            // Insufficient space.
-            Log.d(Constants.TAG, "download aborted - not enough free space");
-            throw new GenerateSaveFileError(Downloads.Impl.STATUS_INSUFFICIENT_SPACE_ERROR,
-                    "insufficient space on external media");
-        }
-
-        File base = new File(root.getPath() + Constants.DEFAULT_DL_SUBDIR);
-        if (!base.isDirectory() && !base.mkdir()) {
-            // Can't create download directory, e.g. because a file called "download"
-            // already exists at the root level, or the SD card filesystem is read-only.
-            throw new GenerateSaveFileError(Downloads.Impl.STATUS_FILE_ERROR,
-                    "unable to create external downloads directory " + base.getPath());
-        }
-        return base;
-    }
-
-    public static boolean isExternalMediaMounted() {
-        if (!Environment.getExternalStorageState().equals(Environment.MEDIA_MOUNTED)) {
-            // No SD card found.
-            Log.d(Constants.TAG, "no external storage");
-            return false;
-        }
-        return true;
-    }
-
-    private static File getCacheDestination(Context context, long contentLength)
-            throws GenerateSaveFileError {
-        File base;
-        base = Environment.getDownloadCacheDirectory();
-        long bytesAvailable = getAvailableBytes(base);
-        while (bytesAvailable < contentLength) {
-            // Insufficient space; try discarding purgeable files.
-            if (!discardPurgeableFiles(context, contentLength - bytesAvailable)) {
-                // No files to purge, give up.
-                throw new GenerateSaveFileError(Downloads.Impl.STATUS_INSUFFICIENT_SPACE_ERROR,
-                        "not enough free space in internal download storage, unable to free any "
-                        + "more");
-            }
-            bytesAvailable = getAvailableBytes(base);
-        }
-        return base;
-    }
-
-    /**
-     * @return the number of bytes available on the filesystem rooted at the given File
-     */
-    public static long getAvailableBytes(File root) {
-        StatFs stat = new StatFs(root.getPath());
-        // put a bit of margin (in case creating the file grows the system by a few blocks)
-        long availableBlocks = (long) stat.getAvailableBlocks() - 4;
-        return stat.getBlockSize() * availableBlocks;
     }
 
     private static String chooseFilename(String url, String hint, String contentDisposition,
@@ -360,8 +246,9 @@ public class Helpers {
             filename = Constants.DEFAULT_DL_FILENAME;
         }
 
-        filename = filename.replaceAll("[^a-zA-Z0-9\\.\\-_]+", "_");
-
+        // The VFAT file system is assumed as target for downloads.
+        // Replace invalid characters according to the specifications of VFAT.
+        filename = replaceInvalidVfatCharacters(filename);
 
         return filename;
     }
@@ -405,12 +292,11 @@ public class Helpers {
     }
 
     private static String chooseExtensionFromFilename(String mimeType, int destination,
-            String filename, int dotIndex) {
+            String filename, int lastDotIndex) {
         String extension = null;
         if (mimeType != null) {
             // Compare the last segment of the extension against the mime type.
             // If there's a mismatch, discard the entire extension.
-            int lastDotIndex = filename.lastIndexOf('.');
             String typeFromExt = MimeTypeMap.getSingleton().getMimeTypeFromExtension(
                     filename.substring(lastDotIndex + 1));
             if (typeFromExt == null || !typeFromExt.equalsIgnoreCase(mimeType)) {
@@ -430,17 +316,18 @@ public class Helpers {
             if (Constants.LOGVV) {
                 Log.v(Constants.TAG, "keeping extension");
             }
-            extension = filename.substring(dotIndex);
+            extension = filename.substring(lastDotIndex);
         }
         return extension;
     }
 
     private static String chooseUniqueFilename(int destination, String filename,
-            String extension, boolean recoveryDir) throws GenerateSaveFileError {
+            String extension, boolean recoveryDir) throws StopRequestException {
         String fullFilename = filename + extension;
         if (!new File(fullFilename).exists()
                 && (!recoveryDir ||
                 (destination != Downloads.Impl.DESTINATION_CACHE_PARTITION &&
+                        destination != Downloads.Impl.DESTINATION_SYSTEMCACHE_PARTITION &&
                         destination != Downloads.Impl.DESTINATION_CACHE_PARTITION_PURGEABLE &&
                         destination != Downloads.Impl.DESTINATION_CACHE_PARTITION_NOROAMING))) {
             return fullFilename;
@@ -473,70 +360,25 @@ public class Helpers {
                 sequence += sRandom.nextInt(magnitude) + 1;
             }
         }
-        throw new GenerateSaveFileError(Downloads.Impl.STATUS_FILE_ERROR,
+        throw new StopRequestException(Downloads.Impl.STATUS_FILE_ERROR,
                 "failed to generate an unused filename on internal download storage");
-    }
-
-    /**
-     * Deletes purgeable files from the cache partition. This also deletes
-     * the matching database entries. Files are deleted in LRU order until
-     * the total byte size is greater than targetBytes.
-     */
-    public static final boolean discardPurgeableFiles(Context context, long targetBytes) {
-        Cursor cursor = context.getContentResolver().query(
-                Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI,
-                null,
-                "( " +
-                Downloads.Impl.COLUMN_STATUS + " = '" + Downloads.Impl.STATUS_SUCCESS + "' AND " +
-                Downloads.Impl.COLUMN_DESTINATION +
-                        " = '" + Downloads.Impl.DESTINATION_CACHE_PARTITION_PURGEABLE + "' )",
-                null,
-                Downloads.Impl.COLUMN_LAST_MODIFICATION);
-        if (cursor == null) {
-            return false;
-        }
-        long totalFreed = 0;
-        try {
-            cursor.moveToFirst();
-            while (!cursor.isAfterLast() && totalFreed < targetBytes) {
-                File file = new File(cursor.getString(cursor.getColumnIndex(Downloads.Impl._DATA)));
-                if (Constants.LOGVV) {
-                    Log.v(Constants.TAG, "purging " + file.getAbsolutePath() + " for " +
-                            file.length() + " bytes");
-                }
-                totalFreed += file.length();
-                file.delete();
-                long id = cursor.getLong(cursor.getColumnIndex(Downloads.Impl._ID));
-                context.getContentResolver().delete(
-                        ContentUris.withAppendedId(Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI, id),
-                        null, null);
-                cursor.moveToNext();
-            }
-        } finally {
-            cursor.close();
-        }
-        if (Constants.LOGV) {
-            if (totalFreed > 0) {
-                Log.v(Constants.TAG, "Purged files, freed " + totalFreed + " for " +
-                        targetBytes + " requested");
-            }
-        }
-        return totalFreed > 0;
     }
 
     /**
      * Returns whether the network is available
      */
-    public static boolean isNetworkAvailable(SystemFacade system) {
-        return system.getActiveNetworkType() != null;
+    public static boolean isNetworkAvailable(SystemFacade system, int uid) {
+        final NetworkInfo info = system.getActiveNetworkInfo(uid);
+        return info != null && info.isConnected();
     }
 
     /**
      * Checks whether the filename looks legitimate
      */
-    public static boolean isFilenameValid(String filename) {
+    static boolean isFilenameValid(String filename, File downloadsDataDir) {
         filename = filename.replaceFirst("/+", "/"); // normalize leading slashes
         return filename.startsWith(Environment.getDownloadCacheDirectory().toString())
+                || filename.startsWith(downloadsDataDir.toString())
                 || filename.startsWith(Environment.getExternalStorageDirectory().toString());
     }
 
@@ -556,7 +398,7 @@ public class Helpers {
         } catch (RuntimeException ex) {
             if (Constants.LOGV) {
                 Log.d(Constants.TAG, "invalid selection [" + selection + "] triggered " + ex);
-            } else if (Config.LOGD) {
+            } else if (false) {
                 Log.d(Constants.TAG, "invalid selection triggered " + ex);
             }
             throw ex;
@@ -802,17 +644,51 @@ public class Helpers {
     }
 
     /**
-     * Delete the given file from device
-     * and delete its row from the downloads database.
+     * Replace invalid filename characters according to
+     * specifications of the VFAT.
+     * @note Package-private due to testing.
      */
-    /* package */ static void deleteFile(ContentResolver resolver, long id, String path, String mimeType) {
-        try {
-            File file = new File(path);
-            file.delete();
-        } catch (Exception e) {
-            Log.w(Constants.TAG, "file: '" + path + "' couldn't be deleted", e);
+    private static String replaceInvalidVfatCharacters(String filename) {
+        final char START_CTRLCODE = 0x00;
+        final char END_CTRLCODE = 0x1f;
+        final char QUOTEDBL = 0x22;
+        final char ASTERISK = 0x2A;
+        final char SLASH = 0x2F;
+        final char COLON = 0x3A;
+        final char LESS = 0x3C;
+        final char GREATER = 0x3E;
+        final char QUESTION = 0x3F;
+        final char BACKSLASH = 0x5C;
+        final char BAR = 0x7C;
+        final char DEL = 0x7F;
+        final char UNDERSCORE = 0x5F;
+
+        StringBuffer sb = new StringBuffer();
+        char ch;
+        boolean isRepetition = false;
+        for (int i = 0; i < filename.length(); i++) {
+            ch = filename.charAt(i);
+            if ((START_CTRLCODE <= ch &&
+                ch <= END_CTRLCODE) ||
+                ch == QUOTEDBL ||
+                ch == ASTERISK ||
+                ch == SLASH ||
+                ch == COLON ||
+                ch == LESS ||
+                ch == GREATER ||
+                ch == QUESTION ||
+                ch == BACKSLASH ||
+                ch == BAR ||
+                ch == DEL){
+                if (!isRepetition) {
+                    sb.append(UNDERSCORE);
+                    isRepetition = true;
+                }
+            } else {
+                sb.append(ch);
+                isRepetition = false;
+            }
         }
-        resolver.delete(Downloads.Impl.ALL_DOWNLOADS_CONTENT_URI, Downloads.Impl._ID + " = ? ",
-                new String[]{String.valueOf(id)});
+        return sb.toString();
     }
 }

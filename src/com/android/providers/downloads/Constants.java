@@ -16,7 +16,9 @@
 
 package com.android.providers.downloads;
 
-import android.util.Config;
+import android.os.Build;
+import android.os.Environment;
+import android.text.TextUtils;
 import android.util.Log;
 
 /**
@@ -73,6 +75,8 @@ public class Constants {
     /** The default extension for binary files if we can't get one at the HTTP level */
     public static final String DEFAULT_DL_BINARY_EXTENSION = ".bin";
 
+    public static final String PROVIDER_PACKAGE_NAME = "com.android.providers.downloads";
+
     /**
      * When a number has to be appended to the filename, this string is used to separate the
      * base filename from the sequence number
@@ -80,20 +84,43 @@ public class Constants {
     public static final String FILENAME_SEQUENCE_SEPARATOR = "-";
 
     /** Where we store downloaded files on the external storage */
-    public static final String DEFAULT_DL_SUBDIR = "/download";
-
-    /** A magic filename that is allowed to exist within the system cache */
-    public static final String KNOWN_SPURIOUS_FILENAME = "lost+found";
+    public static final String DEFAULT_DL_SUBDIR = "/" + Environment.DIRECTORY_DOWNLOADS;
 
     /** A magic filename that is allowed to exist within the system cache */
     public static final String RECOVERY_DIRECTORY = "recovery";
 
     /** The default user agent used for downloads */
-    public static final String DEFAULT_USER_AGENT = "AndroidDownloadManager";
+    public static final String DEFAULT_USER_AGENT;
 
-    /** The MIME type of special DRM files */
-    public static final String MIMETYPE_DRM_MESSAGE =
-            android.drm.mobile1.DrmRawContent.DRM_MIMETYPE_MESSAGE_STRING;
+    static {
+        final StringBuilder builder = new StringBuilder();
+
+        final boolean validRelease = !TextUtils.isEmpty(Build.VERSION.RELEASE);
+        final boolean validId = !TextUtils.isEmpty(Build.ID);
+        final boolean includeModel = "REL".equals(Build.VERSION.CODENAME)
+                && !TextUtils.isEmpty(Build.MODEL);
+
+        builder.append("AndroidDownloadManager");
+        if (validRelease) {
+            builder.append("/").append(Build.VERSION.RELEASE);
+        }
+        builder.append(" (Linux; U; Android");
+        if (validRelease) {
+            builder.append(" ").append(Build.VERSION.RELEASE);
+        }
+        if (includeModel || validId) {
+            builder.append(";");
+            if (includeModel) {
+                builder.append(" ").append(Build.MODEL);
+            }
+            if (validId) {
+                builder.append(" Build/").append(Build.ID);
+            }
+        }
+        builder.append(")");
+
+        DEFAULT_USER_AGENT = builder.toString();
+    }
 
     /** The MIME type of APKs */
     public static final String MIMETYPE_APK = "application/vnd.android.package";
@@ -145,8 +172,7 @@ public class Constants {
 
     /** Enable verbose logging - use with "setprop log.tag.DownloadManager VERBOSE" */
     private static final boolean LOCAL_LOGV = false;
-    public static final boolean LOGV = Config.LOGV
-            || (Config.LOGD && LOCAL_LOGV && Log.isLoggable(TAG, Log.VERBOSE));
+    public static final boolean LOGV = LOCAL_LOGV && Log.isLoggable(TAG, Log.VERBOSE);
 
     /** Enable super-verbose logging */
     private static final boolean LOCAL_LOGVV = false;

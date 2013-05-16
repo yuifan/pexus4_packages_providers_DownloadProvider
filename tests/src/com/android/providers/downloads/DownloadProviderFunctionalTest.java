@@ -23,11 +23,14 @@ import android.net.Uri;
 import android.os.Environment;
 import android.provider.Downloads;
 import android.test.suitebuilder.annotation.LargeTest;
-import tests.http.MockWebServer;
-import tests.http.RecordedRequest;
+import android.util.Log;
+
+import com.google.mockwebserver.MockWebServer;
+import com.google.mockwebserver.RecordedRequest;
 
 import java.io.InputStream;
 import java.net.MalformedURLException;
+import java.net.UnknownHostException;
 
 /**
  * This test exercises the entire download manager working together -- it requests downloads through
@@ -36,20 +39,22 @@ import java.net.MalformedURLException;
  * device to serve downloads.
  */
 @LargeTest
-public class DownloadManagerFunctionalTest extends AbstractDownloadManagerFunctionalTest {
-    public DownloadManagerFunctionalTest() {
+public class DownloadProviderFunctionalTest extends AbstractDownloadProviderFunctionalTest {
+    private static final String TAG = "DownloadManagerFunctionalTest";
+
+    public DownloadProviderFunctionalTest() {
         super(new FakeSystemFacade());
     }
 
-    public void testBasicRequest() throws Exception {
-        enqueueResponse(HTTP_OK, FILE_CONTENT);
+    public void testDownloadTextFile() throws Exception {
+        enqueueResponse(buildResponse(HTTP_OK, FILE_CONTENT));
 
         String path = "/download_manager_test_path";
         Uri downloadUri = requestDownload(path);
-        assertEquals(Downloads.STATUS_PENDING, getDownloadStatus(downloadUri));
+        assertEquals(Downloads.Impl.STATUS_PENDING, getDownloadStatus(downloadUri));
         assertTrue(mTestContext.mHasServiceBeenStarted);
 
-        runUntilStatus(downloadUri, Downloads.STATUS_SUCCESS);
+        runUntilStatus(downloadUri, Downloads.Impl.STATUS_SUCCESS);
         RecordedRequest request = takeRequest();
         assertEquals("GET", request.getMethod());
         assertEquals(path, request.getPath());
@@ -59,35 +64,37 @@ public class DownloadManagerFunctionalTest extends AbstractDownloadManagerFuncti
     }
 
     public void testDownloadToCache() throws Exception {
-        enqueueResponse(HTTP_OK, FILE_CONTENT);
+        enqueueResponse(buildResponse(HTTP_OK, FILE_CONTENT));
+
         Uri downloadUri = requestDownload("/path");
-        updateDownload(downloadUri, Downloads.COLUMN_DESTINATION,
-                       Integer.toString(Downloads.DESTINATION_CACHE_PARTITION));
-        runUntilStatus(downloadUri, Downloads.STATUS_SUCCESS);
+        updateDownload(downloadUri, Downloads.Impl.COLUMN_DESTINATION,
+                       Integer.toString(Downloads.Impl.DESTINATION_CACHE_PARTITION));
+        runUntilStatus(downloadUri, Downloads.Impl.STATUS_SUCCESS);
         assertEquals(FILE_CONTENT, getDownloadContents(downloadUri));
-        assertStartsWith(Environment.getDownloadCacheDirectory().getPath(),
+        assertStartsWith(getContext().getCacheDir().getAbsolutePath(),
                          getDownloadFilename(downloadUri));
     }
 
     public void testRoaming() throws Exception {
+        enqueueResponse(buildResponse(HTTP_OK, FILE_CONTENT));
+        enqueueResponse(buildResponse(HTTP_OK, FILE_CONTENT));
+
         mSystemFacade.mActiveNetworkType = ConnectivityManager.TYPE_MOBILE;
         mSystemFacade.mIsRoaming = true;
 
         // for a normal download, roaming is fine
-        enqueueResponse(HTTP_OK, FILE_CONTENT);
         Uri downloadUri = requestDownload("/path");
-        runUntilStatus(downloadUri, Downloads.STATUS_SUCCESS);
+        runUntilStatus(downloadUri, Downloads.Impl.STATUS_SUCCESS);
 
         // when roaming is disallowed, the download should pause...
         downloadUri = requestDownload("/path");
-        updateDownload(downloadUri, Downloads.COLUMN_DESTINATION,
-                       Integer.toString(Downloads.DESTINATION_CACHE_PARTITION_NOROAMING));
+        updateDownload(downloadUri, Downloads.Impl.COLUMN_DESTINATION,
+                       Integer.toString(Downloads.Impl.DESTINATION_CACHE_PARTITION_NOROAMING));
         runUntilStatus(downloadUri, Downloads.Impl.STATUS_WAITING_FOR_NETWORK);
 
         // ...and pick up when we're off roaming
-        enqueueResponse(HTTP_OK, FILE_CONTENT);
         mSystemFacade.mIsRoaming = false;
-        runUntilStatus(downloadUri, Downloads.STATUS_SUCCESS);
+        runUntilStatus(downloadUri, Downloads.Impl.STATUS_SUCCESS);
     }
 
     /**
@@ -104,15 +111,26 @@ public class DownloadManagerFunctionalTest extends AbstractDownloadManagerFuncti
 
     private void runUntilStatus(Uri downloadUri, int status) throws Exception {
         runService();
+        boolean done = false;
+        while (!done) {
+            int rslt = getDownloadStatus(downloadUri);
+            if (rslt == Downloads.Impl.STATUS_RUNNING || rslt == Downloads.Impl.STATUS_PENDING) {
+                Log.i(TAG, "status is: " + rslt + ", for: " + downloadUri);
+                DownloadHandler.getInstance().waitUntilDownloadsTerminate();
+                Thread.sleep(100);
+            } else {
+                done = true;
+            }
+        }
         assertEquals(status, getDownloadStatus(downloadUri));
     }
 
     protected int getDownloadStatus(Uri downloadUri) {
-        return Integer.valueOf(getDownloadField(downloadUri, Downloads.COLUMN_STATUS));
+        return Integer.valueOf(getDownloadField(downloadUri, Downloads.Impl.COLUMN_STATUS));
     }
 
     private String getDownloadFilename(Uri downloadUri) {
-        return getDownloadField(downloadUri, Downloads._DATA);
+        return getDownloadField(downloadUri, Downloads.Impl._DATA);
     }
 
     private String getDownloadField(Uri downloadUri, String column) {
@@ -130,11 +148,11 @@ public class DownloadManagerFunctionalTest extends AbstractDownloadManagerFuncti
     /**
      * Request a download from the Download Manager.
      */
-    private Uri requestDownload(String path) throws MalformedURLException {
+    private Uri requestDownload(String path) throws MalformedURLException, UnknownHostException {
         ContentValues values = new ContentValues();
-        values.put(Downloads.COLUMN_URI, getServerUri(path));
-        values.put(Downloads.COLUMN_DESTINATION, Downloads.DESTINATION_EXTERNAL);
-        return mResolver.insert(Downloads.CONTENT_URI, values);
+        values.put(Downloads.Impl.COLUMN_URI, getServerUri(path));
+        values.put(Downloads.Impl.COLUMN_DESTINATION, Downloads.Impl.DESTINATION_EXTERNAL);
+        return mResolver.insert(Downloads.Impl.CONTENT_URI, values);
     }
 
     /**
